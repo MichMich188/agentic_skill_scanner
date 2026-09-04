@@ -36,7 +36,7 @@ from rules import (
     scan_file_for_patterns,
     PatternFinding,
 )
-from llm_rules import LLMRuleResult, run_consistency_check, run_dependency_check
+from llm_rules import LLMRuleResult, run_consistency_check, run_dependency_check, run_hiddenprompt_check
 
 
 # ---------------------------------------------------------------------------
@@ -87,6 +87,7 @@ class RuleResult:
     findings: List[Finding] = field(default_factory=list)
     used_mock: bool       = False          # True if LLM rule fell back to mock agent
     llm_confidence: str   = ""            # "low" | "medium" | "high" (LLM rules only)
+    llm_backend: str      = ""            # "ollama" | "openai" | "mock" | ""
     error: Optional[str]  = None          # error message if something went wrong
 
 
@@ -177,6 +178,7 @@ def _split_content(files: List[str]):
         header = f"\n\n=== {path} ===\n"
         if ext.lower() in INSTRUCTION_EXTENSIONS:
             instructions_parts.append(header + text)
+            code_parts.append(header + text)
         else:
             code_parts.append(header + text)
     instructions = "\n".join(instructions_parts)
@@ -267,6 +269,7 @@ def run_consistency_rule(instructions: str, code: str) -> RuleResult:
     result.verdict = llm_result.verdict
     result.used_mock = llm_result.used_mock
     result.llm_confidence = llm_result.confidence
+    result.llm_backend = llm_result.llm_backend
     result.error = llm_result.error
 
     # Represent the LLM's judgment as a single Finding so the reporter can
@@ -278,7 +281,7 @@ def run_consistency_rule(instructions: str, code: str) -> RuleResult:
         category="llm_consistency",
         weight=0,              # LLM rules don't contribute to Rule 1's numeric score
         description="LLM consistency analysis: declared intent vs. implementation",
-        snippet=llm_result.reason[:300],
+        snippet=llm_result.reason[:800],
     ))
 
     # If the LLM flagged specific discrepancies, add one Finding per item
@@ -319,6 +322,7 @@ def run_dependency_rule(all_content: str) -> RuleResult:
     result.verdict = llm_result.verdict
     result.used_mock = llm_result.used_mock
     result.llm_confidence = llm_result.confidence
+    result.llm_backend = llm_result.llm_backend
     result.error = llm_result.error
 
     # Summary finding
@@ -329,7 +333,7 @@ def run_dependency_rule(all_content: str) -> RuleResult:
         category="llm_dependency",
         weight=0,
         description="LLM dependency audit: URLs, imports, and download targets",
-        snippet=llm_result.reason[:300],
+        snippet=llm_result.reason[:800],
     ))
 
     # One Finding per suspicious item identified by the LLM
@@ -346,6 +350,55 @@ def run_dependency_rule(all_content: str) -> RuleResult:
 
     return result
 
+# ---------------------------------------------------------------------------
+# Rule 4 — hidden prompt (LLM)
+# ---------------------------------------------------------------------------
+
+def run_hiddenprompt_rule(all_content: str) -> RuleResult:
+    """
+    Rule 4: Check to find if a skill in containing hidden prompts.
+
+    all_content should be the full concatenated text of SKILL.md + all scripts,
+    so the LLM has context for whether a dependency makes sense for this skill.
+    """
+    result = RuleResult(rule_id="hidden_prompt")
+
+    if not all_content.strip():
+        result.verdict = "Benign"
+        return result
+
+    llm_result: LLMRuleResult = run_hiddenprompt_check(all_content)
+
+    result.verdict = llm_result.verdict
+    result.used_mock = llm_result.used_mock
+    result.llm_confidence = llm_result.confidence
+    result.llm_backend = llm_result.llm_backend
+    result.error = llm_result.error
+
+    # Summary finding
+    result.findings.append(Finding(
+        file="[LLM analysis]",
+        line_no=0,
+        rule_id="hidden_prompt",
+        category="llm_dependency",
+        weight=0,
+        description="LLM dependency audit: URLs, imports, and download targets",
+        snippet=llm_result.reason[:800],
+    ))
+
+    # One Finding per suspicious item identified by the LLM
+    for item in llm_result.details.get("suspicious_items", []):
+        result.findings.append(Finding(
+            file="[LLM analysis]",
+            line_no=0,
+            rule_id="hidden_prompt",
+            category="llm_dependency",
+            weight=0,
+            description=f"Hidden Prompt: {item.get('item', '?')}",
+            snippet=item.get("reason", "")[:300],
+        ))
+
+    return result
 
 # ---------------------------------------------------------------------------
 # Verdict combiner
@@ -400,8 +453,12 @@ def scan_path(path: str, run_llm: bool = True) -> ScanResult:
         # ── Rule 3: LLM dependency check ──────────────────────────────────
         r3 = run_dependency_rule(all_content)
         result.rule_results.append(r3)
+        
+        # ── Rule 4: LLM hidden prompt check ──────────────────────────────────
+        r4 = run_hiddenprompt_rule(all_content)
+        result.rule_results.append(r4)
 
-        result.verdict = _worst_verdict(r1.verdict, r2.verdict, r3.verdict)
+        result.verdict = _worst_verdict(r1.verdict, r2.verdict, r3.verdict, r4.verdict)
     else:
         # Static-only mode: only Rule 1 contributes
         result.verdict = r1.verdict
