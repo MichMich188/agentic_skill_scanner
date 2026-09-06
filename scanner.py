@@ -1,24 +1,20 @@
 """
 scanner.py — Orchestration engine for the three top-level scanner rules.
 
-The scanner has exactly three rules, run in order for every skill unit:
+The scanner runs two stages for every skill unit:
 
   ┌─────────────────────────────────────────────────────────────────────┐
-  │  Rule 1 — MALICIOUS_INSTRUCTIONS                                    │
-  │  Static regex patterns across 8 categories (all of rules.py).      │
-  │  Fast. No network call. Runs on every file in the skill.            │
+  │  Stage 1 — MALICIOUS_INSTRUCTIONS  (static, fast, no network)      │
+  │  Regex patterns across 8 categories from rules.py.                 │
   │                                                                     │
-  │  Rule 2 — CONSISTENCY_CHECK                                         │
-  │  LLM compares SKILL.md declared intent vs. what the code does.     │
-  │  Catches trojan skills that look benign from the description.       │
-  │                                                                     │
-  │  Rule 3 — DEPENDENCY_CHECK                                          │
-  │  LLM audits every URL, import, and download target in the skill.   │
-  │  Catches supply-chain attacks via malicious dependencies.           │
+  │  Stage 2 — SINGLE COMBINED LLM CALL  (one request, three checks)  │
+  │  Rule 2: CONSISTENCY_CHECK   — code vs. declared intent            │
+  │  Rule 3: DEPENDENCY_CHECK    — URLs / imports legitimacy           │
+  │  Rule 4: PROMPT_INJECTION    — hidden instructions to AI/scanner   │
   └─────────────────────────────────────────────────────────────────────┘
 
 Each rule independently produces: Benign / Suspicious / Malicious.
-The skill's overall verdict is the worst of the three.
+The skill's overall verdict is the worst of the four.
 
 Public entry point:
     scan_path(path, run_llm=True) -> ScanResult
@@ -36,7 +32,7 @@ from rules import (
     scan_file_for_patterns,
     PatternFinding,
 )
-from llm_rules import LLMRuleResult, run_consistency_check, run_dependency_check, run_hiddenprompt_check
+from llm_rules import CombinedLLMResult, run_combined_llm_analysis
 
 
 # ---------------------------------------------------------------------------
@@ -178,7 +174,6 @@ def _split_content(files: List[str]):
         header = f"\n\n=== {path} ===\n"
         if ext.lower() in INSTRUCTION_EXTENSIONS:
             instructions_parts.append(header + text)
-            code_parts.append(header + text)
         else:
             code_parts.append(header + text)
     instructions = "\n".join(instructions_parts)
@@ -247,158 +242,118 @@ def run_malicious_instructions(files: List[str]) -> RuleResult:
 
 
 # ---------------------------------------------------------------------------
-# Rule 2 — CONSISTENCY_CHECK (LLM)
+# Stage 2 — Combined LLM analysis (single request, three checks)
 # ---------------------------------------------------------------------------
+# Instead of making separate LLM calls for consistency, dependency, and
+# prompt injection, we make ONE call and unpack three results from it.
+# This is faster (one prompt ingestion), cheaper, and simpler to maintain.
 
-def run_consistency_rule(instructions: str, code: str) -> RuleResult:
+def _make_llm_rule_result(rule_id: str, verdict: str, confidence: str,
+                           reason: str, details: dict,
+                           used_mock: bool, llm_backend: str,
+                           error: Optional[str],
+                           summary_desc: str,
+                           detail_key: str,
+                           detail_rule_id: str,
+                           detail_category: str) -> RuleResult:
     """
-    Rule 2: Ask the LLM whether the implementation matches the declared intent.
-
-    If instructions or code are both empty, skip gracefully (returns Benign).
-    The LLM result is converted into one Finding so it appears in all reports.
+    Build a RuleResult from one section of the combined LLM response.
+    Shared by all three LLM checks to avoid repeating the same Finding
+    construction boilerplate.
     """
-    result = RuleResult(rule_id="CONSISTENCY_CHECK")
-
-    if not instructions.strip() and not code.strip():
-        # Nothing to compare — treat as Benign (no content = no mismatch)
-        result.verdict = "Benign"
-        return result
-
-    llm_result: LLMRuleResult = run_consistency_check(instructions, code)
-
-    result.verdict = llm_result.verdict
-    result.used_mock = llm_result.used_mock
-    result.llm_confidence = llm_result.confidence
-    result.llm_backend = llm_result.llm_backend
-    result.error = llm_result.error
-
-    # Represent the LLM's judgment as a single Finding so the reporter can
-    # display it uniformly alongside Rule 1's pattern findings.
+    result = RuleResult(
+        rule_id=rule_id,
+        verdict=verdict,
+        used_mock=used_mock,
+        llm_confidence=confidence,
+        llm_backend=llm_backend,
+        error=error,
+    )
+    # One summary finding with the LLM's overall reason for this check
     result.findings.append(Finding(
         file="[LLM analysis]",
         line_no=0,
-        rule_id="CONSISTENCY_CHECK",
-        category="llm_consistency",
-        weight=0,              # LLM rules don't contribute to Rule 1's numeric score
-        description="LLM consistency analysis: declared intent vs. implementation",
-        snippet=llm_result.reason[:800],
-    ))
-
-    # If the LLM flagged specific discrepancies, add one Finding per item
-    # so they each appear as a separate line in verbose output.
-    for disc in llm_result.details.get("discrepancies", []):
-        result.findings.append(Finding(
-            file="[LLM analysis]",
-            line_no=0,
-            rule_id="CONSISTENCY_DISCREPANCY",
-            category="llm_consistency",
-            weight=0,
-            description="Discrepancy identified by LLM",
-            snippet=str(disc)[:300],
-        ))
-
-    return result
-
-
-# ---------------------------------------------------------------------------
-# Rule 3 — DEPENDENCY_CHECK (LLM)
-# ---------------------------------------------------------------------------
-
-def run_dependency_rule(all_content: str) -> RuleResult:
-    """
-    Rule 3: Ask the LLM to evaluate every URL, import, and download target.
-
-    all_content should be the full concatenated text of SKILL.md + all scripts,
-    so the LLM has context for whether a dependency makes sense for this skill.
-    """
-    result = RuleResult(rule_id="DEPENDENCY_CHECK")
-
-    if not all_content.strip():
-        result.verdict = "Benign"
-        return result
-
-    llm_result: LLMRuleResult = run_dependency_check(all_content)
-
-    result.verdict = llm_result.verdict
-    result.used_mock = llm_result.used_mock
-    result.llm_confidence = llm_result.confidence
-    result.llm_backend = llm_result.llm_backend
-    result.error = llm_result.error
-
-    # Summary finding
-    result.findings.append(Finding(
-        file="[LLM analysis]",
-        line_no=0,
-        rule_id="DEPENDENCY_CHECK",
-        category="llm_dependency",
+        rule_id=rule_id,
+        category=detail_category,
         weight=0,
-        description="LLM dependency audit: URLs, imports, and download targets",
-        snippet=llm_result.reason[:800],
+        description=summary_desc,
+        snippet=reason[:800],
     ))
-
-    # One Finding per suspicious item identified by the LLM
-    for item in llm_result.details.get("suspicious_items", []):
+    # One finding per flagged item (discrepancy / suspicious dependency / injection)
+    for item in details.get(detail_key, []):
+        if isinstance(item, dict):
+            text = item.get("reason", item.get("item", str(item)))
+        else:
+            text = str(item)
         result.findings.append(Finding(
             file="[LLM analysis]",
             line_no=0,
-            rule_id="DEPENDENCY_SUSPICIOUS_ITEM",
-            category="llm_dependency",
+            rule_id=detail_rule_id,
+            category=detail_category,
             weight=0,
-            description=f"Suspicious dependency: {item.get('item', '?')}",
-            snippet=item.get("reason", "")[:300],
+            description=f"Detail: {str(item)[:120] if isinstance(item, str) else item.get('item', '')[:120]}",
+            snippet=text[:300],
         ))
-
     return result
 
-# ---------------------------------------------------------------------------
-# Rule 4 — hidden prompt (LLM)
-# ---------------------------------------------------------------------------
 
-def run_hiddenprompt_rule(all_content: str) -> RuleResult:
+def run_llm_checks(instructions: str, code: str, all_content: str) -> List[RuleResult]:
     """
-    Rule 4: Check to find if a skill in containing hidden prompts.
-
-    all_content should be the full concatenated text of SKILL.md + all scripts,
-    so the LLM has context for whether a dependency makes sense for this skill.
+    Run all three LLM checks in a single combined request.
+    Returns a list of three RuleResult objects (consistency, dependency,
+    prompt_injection) unpacked from the combined LLM response.
     """
-    result = RuleResult(rule_id="hidden_prompt")
+    combined: CombinedLLMResult = run_combined_llm_analysis(
+        instructions, code, all_content
+    )
 
-    if not all_content.strip():
-        result.verdict = "Benign"
-        return result
+    r2 = _make_llm_rule_result(
+        rule_id        = "CONSISTENCY_CHECK",
+        verdict        = combined.consistency_verdict,
+        confidence     = combined.consistency_confidence,
+        reason         = combined.consistency_reason,
+        details        = combined.consistency_details,
+        used_mock      = combined.used_mock,
+        llm_backend    = combined.llm_backend,
+        error          = combined.error,
+        summary_desc   = "LLM: declared intent vs. implementation",
+        detail_key     = "discrepancies",
+        detail_rule_id = "CONSISTENCY_DISCREPANCY",
+        detail_category= "llm_consistency",
+    )
 
-    llm_result: LLMRuleResult = run_hiddenprompt_check(all_content)
+    r3 = _make_llm_rule_result(
+        rule_id        = "DEPENDENCY_CHECK",
+        verdict        = combined.dependency_verdict,
+        confidence     = combined.dependency_confidence,
+        reason         = combined.dependency_reason,
+        details        = combined.dependency_details,
+        used_mock      = combined.used_mock,
+        llm_backend    = combined.llm_backend,
+        error          = combined.error,
+        summary_desc   = "LLM: URLs, imports, and download targets",
+        detail_key     = "suspicious_items",
+        detail_rule_id = "DEPENDENCY_SUSPICIOUS_ITEM",
+        detail_category= "llm_dependency",
+    )
 
-    result.verdict = llm_result.verdict
-    result.used_mock = llm_result.used_mock
-    result.llm_confidence = llm_result.confidence
-    result.llm_backend = llm_result.llm_backend
-    result.error = llm_result.error
+    r4 = _make_llm_rule_result(
+        rule_id        = "PROMPT_INJECTION",
+        verdict        = combined.injection_verdict,
+        confidence     = combined.injection_confidence,
+        reason         = combined.injection_reason,
+        details        = combined.injection_details,
+        used_mock      = combined.used_mock,
+        llm_backend    = combined.llm_backend,
+        error          = combined.error,
+        summary_desc   = "LLM: prompt injection and hidden instructions",
+        detail_key     = "suspicious_items",
+        detail_rule_id = "INJECTION_ITEM",
+        detail_category= "llm_injection",
+    )
 
-    # Summary finding
-    result.findings.append(Finding(
-        file="[LLM analysis]",
-        line_no=0,
-        rule_id="hidden_prompt",
-        category="llm_dependency",
-        weight=0,
-        description="LLM dependency audit: URLs, imports, and download targets",
-        snippet=llm_result.reason[:800],
-    ))
+    return [r2, r3, r4]
 
-    # One Finding per suspicious item identified by the LLM
-    for item in llm_result.details.get("suspicious_items", []):
-        result.findings.append(Finding(
-            file="[LLM analysis]",
-            line_no=0,
-            rule_id="hidden_prompt",
-            category="llm_dependency",
-            weight=0,
-            description=f"Hidden Prompt: {item.get('item', '?')}",
-            snippet=item.get("reason", "")[:300],
-        ))
-
-    return result
 
 # ---------------------------------------------------------------------------
 # Verdict combiner
@@ -443,22 +398,19 @@ def scan_path(path: str, run_llm: bool = True) -> ScanResult:
     result.rule_results.append(r1)
 
     if run_llm:
-        # Split file content so LLM rules get the right context
+        # Split content into instructions vs. code for the consistency check,
+        # and keep a combined version for dependency + injection checks.
         instructions, code, all_content = _split_content(files)
 
-        # ── Rule 2: LLM consistency check ─────────────────────────────────
-        r2 = run_consistency_rule(instructions, code)
-        result.rule_results.append(r2)
+        # Single combined LLM call — returns three RuleResults at once.
+        # This is faster than three separate calls: one prompt ingestion,
+        # one generation pass, all answers in a single JSON response.
+        llm_results = run_llm_checks(instructions, code, all_content)
+        result.rule_results.extend(llm_results)
 
-        # ── Rule 3: LLM dependency check ──────────────────────────────────
-        r3 = run_dependency_rule(all_content)
-        result.rule_results.append(r3)
-        
-        # ── Rule 4: LLM hidden prompt check ──────────────────────────────────
-        r4 = run_hiddenprompt_rule(all_content)
-        result.rule_results.append(r4)
-
-        result.verdict = _worst_verdict(r1.verdict, r2.verdict, r3.verdict, r4.verdict)
+        result.verdict = _worst_verdict(
+            r1.verdict, *[r.verdict for r in llm_results]
+        )
     else:
         # Static-only mode: only Rule 1 contributes
         result.verdict = r1.verdict

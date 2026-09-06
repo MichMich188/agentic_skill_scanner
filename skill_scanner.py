@@ -40,6 +40,15 @@ def _c(text, key, use_color):
 # ── Skill-unit discovery ───────────────────────────────────────────────────
 
 def _find_skill_units(root: str):
+    """
+    Identify skill units to scan.
+
+    A "skill unit" is any of:
+      - A single file passed directly (any extension, any name)
+      - A directory containing SKILL.md or any other .md file at the top level
+      - A directory anywhere in the tree that contains a .md file
+
+    """
     if os.path.isfile(root):
         return [root] if root.lower().endswith(".md") else []
 
@@ -107,13 +116,13 @@ def _build_reasoning(result: ScanResult, verbose: bool) -> list[str]:
             # rules fire the same backend result.
             seen_rule_ids: set = set()
             for f in rr.findings:
-                if f.rule_id in ("CONSISTENCY_CHECK", "DEPENDENCY_CHECK", "hidden_prompt") and f.snippet:
+                if f.rule_id in ("CONSISTENCY_CHECK", "DEPENDENCY_CHECK") and f.snippet:
                     # One summary line per rule_id — prevents the same rule
                     # from printing twice if findings are duplicated.
                     if f.rule_id not in seen_rule_ids:
                         seen_rule_ids.add(f.rule_id)
                         lines.append(f"• {f.snippet.rstrip('.')}")
-                elif f.rule_id in ("CONSISTENCY_DISCREPANCY", "DEPENDENCY_SUSPICIOUS_ITEM, hidden_prompt") and verbose:
+                elif f.rule_id in ("CONSISTENCY_DISCREPANCY", "DEPENDENCY_SUSPICIOUS_ITEM", "INJECTION_ITEM") and verbose:
                     lines.append(f"  ↳ {f.snippet}")
 
     return lines
